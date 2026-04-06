@@ -1,0 +1,50 @@
+services:
+  unsloth:
+    image: unsloth/unsloth:latest
+    container_name: unsloth
+    restart: unless-stopped
+
+    ports:
+      - "8888:8888"
+      - "8000:8000"
+      - "2222:22"
+
+    environment:
+      JUPYTER_PASSWORD: "change-me"
+
+      HF_HOME: /data/huggingface
+      HUGGINGFACE_HUB_CACHE: /data/huggingface/hub
+      TRANSFORMERS_CACHE: /data/huggingface/transformers
+
+      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+
+    volumes:
+      - ./unsloth_data:/data
+      - ./work:/workspace/work
+
+      # Pre-downloaded model weights (in /workspace/models so Studio sees it)
+      - /home/pasha/train/ruGPT3XL-8k:/workspace/models/ruGPT3XL-8k:ro
+
+      # Patch unsloth code: mount modified files over installed package
+      - ./unsloth/unsloth/models/_utils.py:/opt/conda/lib/python3.11/site-packages/unsloth/models/_utils.py:ro
+
+      # Persist Studio state (auth, runs DB) across container recreates
+      - ./unsloth_data/studio:/home/unsloth/.unsloth/studio
+
+      # Studio config: model defaults + model name mapping
+      - ./unsloth/studio/backend/assets/configs/model_defaults/other/evilfreelancer_ruGPT3XL-8k.yaml:/opt/conda/lib/python3.11/site-packages/studio/backend/assets/configs/model_defaults/other/evilfreelancer_ruGPT3XL-8k.yaml:ro
+      - ./unsloth/studio/backend/utils/models/model_config.py:/opt/conda/lib/python3.11/site-packages/studio/backend/utils/models/model_config.py:ro
+
+    working_dir: /workspace
+
+    tty: true
+    stdin_open: true
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              #device_ids: [ "1" ]
+              count: all
+              capabilities: [gpu]
