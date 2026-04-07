@@ -168,11 +168,25 @@ def main():
     # ── Step 4b: Verify masking on a sample ──
     from masking import (
         AssistantOnlyCollator, get_marker_ids, print_masking_diagnostic,
+        build_assistant_mask,
     )
     resp_ids, end_ids = get_marker_ids(tokenizer)
     print(f"\n  Response marker IDs: {resp_ids}")
     print(f"  Message end IDs:     {end_ids}")
     print_masking_diagnostic(tokenizer, train_ds[0]["text"], resp_ids, end_ids)
+
+    # Filter out samples that have no assistant responses (would cause NaN loss)
+    def _has_assistant_tokens(example):
+        ids = tokenizer.encode(example["text"], add_special_tokens=False)
+        labels = build_assistant_mask(ids, resp_ids, end_ids)
+        return any(l != -100 for l in labels)
+
+    train_before = len(train_ds)
+    eval_before = len(eval_ds)
+    train_ds = train_ds.filter(_has_assistant_tokens, num_proc=4, desc="Filter no-assistant train")
+    eval_ds = eval_ds.filter(_has_assistant_tokens, num_proc=4, desc="Filter no-assistant eval")
+    print(f"  Filtered no-assistant samples: train {train_before}->{len(train_ds)}, "
+          f"eval {eval_before}->{len(eval_ds)}")
 
     # ── Step 5: Configure trainer ──
     print("\n[5/6] Configuring SFTTrainer ...")
@@ -219,7 +233,7 @@ def main():
         metric_for_best_model="eval_loss",
         greater_is_better=False,
 
-        logging_steps=10,
+        logging_steps=1,
         logging_dir=f"{OUTPUT_DIR}/logs",
 
         seed=42,

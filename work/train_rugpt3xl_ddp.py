@@ -204,7 +204,7 @@ def main():
         metric_for_best_model="eval_loss",
         greater_is_better=False,
 
-        logging_steps=10,
+        logging_steps=1,
         logging_dir=f"{OUTPUT_DIR}/logs",
 
         seed=42,

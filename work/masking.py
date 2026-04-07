@@ -71,6 +71,7 @@ class AssistantOnlyCollator:
     max_seq_length: int | None = None
     mlm: bool = False
     _call_count: int = field(default=0, repr=False, init=False)
+    _zero_label_count: int = field(default=0, repr=False, init=False)
 
     def __call__(self, features: list[dict]) -> dict:
         self._call_count += 1
@@ -86,21 +87,23 @@ class AssistantOnlyCollator:
             )
             feat.pop("labels", None)
 
-        if self._call_count <= 3:
-            for i, (lab, feat) in enumerate(zip(labels_list, features)):
-                ids = feat["input_ids"]
-                if isinstance(ids, torch.Tensor):
-                    ids = ids.tolist()
-                trained = sum(1 for x in lab if x != IGNORE_INDEX)
-                print(f"  [Collator batch#{self._call_count} sample#{i}] "
-                      f"len={len(ids)}, trained={trained}/{len(lab)}, "
-                      f"first_10_ids={ids[:10]}")
-                if trained == 0:
+        for i, lab in enumerate(labels_list):
+            trained = sum(1 for x in lab if x != IGNORE_INDEX)
+            if trained == 0:
+                self._zero_label_count += 1
+                if self._zero_label_count <= 10:
+                    ids = features[i]["input_ids"]
+                    if isinstance(ids, torch.Tensor):
+                        ids = ids.tolist()
                     resp_pos = _find_subsequence(ids, self.response_marker_ids)
                     end_pos = _find_subsequence(ids, self.message_end_ids)
-                    print(f"    WARNING: 0 trained tokens! "
-                          f"resp_marker_positions={resp_pos}, "
-                          f"end_marker_positions={end_pos}")
+                    print(f"  [Collator] WARNING: batch#{self._call_count} sample#{i} "
+                          f"has 0 trained tokens (len={len(ids)})! "
+                          f"resp_positions={resp_pos}, end_positions={end_pos}, "
+                          f"first_20_ids={ids[:20]}")
+            elif self._call_count <= 2:
+                print(f"  [Collator batch#{self._call_count} sample#{i}] "
+                      f"len={len(lab)}, trained={trained}/{len(lab)}")
 
         batch = self.tokenizer.pad(
             features,
