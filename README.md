@@ -23,14 +23,27 @@ docker exec unsloth python -u /workspace/work/train_rugpt3xl.py
 Studio UI is available at `http://<host>:8000` (default credentials: `unsloth` / `12345678`).
 Jupyter Lab is at `http://<host>:8888`.
 
-### Multi-GPU pipeline (device_map="balanced", recommended)
+### Multi-GPU FSDP (recommended, fastest)
+
+```bash
+docker exec unsloth torchrun --nproc_per_node=4 /workspace/work/train_rugpt3xl_fsdp.py
+```
+
+True data-parallel training via PyTorch Fully Sharded Data Parallelism (FSDP).
+Model parameters, gradients and optimizer states are sharded across all 4 GPUs.
+No quantization needed - bf16 throughout, FSDP handles memory distribution.
+GBS = 128 (4 GPUs * 1 batch * 32 gradient accumulation).
+~2-3x faster than pipeline-parallel mode.
+
+### Multi-GPU pipeline (device_map="balanced")
 
 ```bash
 docker exec unsloth python -u /workspace/work/train_rugpt3xl_multigpu.py
 ```
 
-Splits 24 layers across all GPUs. GBS = 128 (1 batch * 128 gradient accumulation).
-Automatically patches the tokenizer with GigaChat3 special tokens on first run.
+Splits 24 layers across all GPUs sequentially (single-stream pipeline).
+GBS = 128 (1 batch * 128 gradient accumulation).
+Uses QLoRA (4-bit NF4). Slower than FSDP but uses less total GPU memory.
 
 ### Multi-GPU DDP (4x RTX 5060 Ti)
 
@@ -38,8 +51,9 @@ Automatically patches the tokenizer with GigaChat3 special tokens on first run.
 docker exec unsloth torchrun --nproc_per_node=4 /workspace/work/train_rugpt3xl_ddp.py
 ```
 
-Each GPU trains its own copy of the model on a separate data batch.
+Each GPU trains its own full copy of the model on a separate data batch.
 GBS = 128 (4 GPUs * 1 batch * 32 gradient accumulation).
+Requires enough VRAM to fit the full model per GPU.
 
 ### Monitor training
 
@@ -192,6 +206,49 @@ Typical masking ratio is ~75% masked / ~25% trained (varies by sample).
 
 ## Training configuration
 
+### Multi-GPU FSDP (recommended)
+
+Launched via `work/train_rugpt3xl_fsdp.py` with `torchrun --nproc_per_node=4`.
+All 4 GPUs participate in true data-parallel training.
+
+| Parameter | Value |
+|---|---|
+| Model | `ruGPT3XL-8k` (1.3B params, local mount) |
+| Method | LoRA (bf16, no quantization) |
+| Parallelism | FSDP FULL_SHARD (params + grads + optimizer sharded) |
+| FSDP wrap policy | `TRANSFORMER_BASED_WRAP` on `RuGPT3XLDecoderLayer` |
+| Activation checkpointing | FSDP-native (via fsdp_config) |
+| `max_seq_length` | 8192 |
+| LoRA rank / alpha | 64 / 128 |
+| Target modules | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `up_proj`, `down_proj` |
+| `modules_to_save` | `embed_tokens`, `lm_head` |
+| Epochs | 3 |
+| Per-device batch size | 1 |
+| Gradient accumulation | 32 (GBS = 4 * 1 * 32 = 128) |
+| Learning rate | 5e-5, cosine schedule |
+| Warmup | 10% of total steps |
+| Weight decay | 0.01 |
+| Max grad norm | 1.0 |
+| Optimizer | `adamw_torch` (fp32 states, sharded by FSDP) |
+| Precision | bf16 |
+| Eval strategy | every 100 steps + on start |
+| Eval subset | 500 random samples (from 7k) |
+| Save strategy | every 100 steps, keep best 5 |
+| Best model metric | `eval_loss` (lower is better) |
+| Early stopping | patience = 5 evals |
+| Loss masking | assistant-only via `AssistantOnlyCollator` |
+| TensorBoard | `/workspace/work/runs/rugpt3xl-8k-fsdp/logs` |
+
+Memory per GPU (4x RTX 5060 Ti 16GB):
+
+| Component | Per GPU |
+|---|---|
+| Sharded params (bf16) | ~650 MB |
+| Sharded optimizer (fp32) | ~2.6 GB |
+| Sharded gradients (bf16) | ~650 MB |
+| Activations + buffers | ~8-10 GB |
+| **Total** | **~12-14 GB** |
+
 ### Multi-GPU pipeline (device_map="balanced")
 
 Launched via `work/train_rugpt3xl_multigpu.py`. Splits 24 model layers across all GPUs.
@@ -249,9 +306,11 @@ Launched via `work/train_rugpt3xl.py` which calls the Unsloth Studio REST API.
 ```
 docker-compose.yaml                - Container setup, GPU, volumes
 work/
+  train_rugpt3xl_fsdp.py           - FSDP training on 4 GPUs (recommended, fastest)
   train_rugpt3xl_multigpu.py       - Pipeline-parallel training (device_map="balanced")
   train_rugpt3xl_ddp.py            - DDP training on 4 GPUs via torchrun
   train_rugpt3xl.py                - Training via Studio API (single GPU)
+  accelerate_fsdp.yaml             - Accelerate FSDP config (alternative launcher)
   masking.py                       - AssistantOnlyCollator + masking logic
   tokenizer_setup.py               - Idempotent GigaChat3 tokenizer patching
   patch_tokenizer.py               - Manual tokenizer patching CLI wrapper
