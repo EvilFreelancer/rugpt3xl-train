@@ -29,6 +29,35 @@ GIGACHAT3_SPECIAL_TOKENS = [
 CHAT_TEMPLATE_FILENAME = "chat_template_gigachat3.jinja"
 
 
+def _fix_tokenizer_config_json(model_dir: Path, verbose: bool = True) -> None:
+    """
+    Some transformers versions write extra_special_tokens as a list,
+    but newer versions expect a dict. Replace it with the standard
+    additional_special_tokens list to avoid AttributeError on load.
+    """
+    tc_path = model_dir / "tokenizer_config.json"
+    if not tc_path.exists():
+        return
+    tc = json.loads(tc_path.read_text(encoding="utf-8"))
+    rewrite = False
+
+    extra = tc.pop("extra_special_tokens", None)
+    if extra is not None:
+        rewrite = True
+        if isinstance(extra, list):
+            existing = tc.get("additional_special_tokens", [])
+            merged = list(dict.fromkeys(existing + extra))
+            tc["additional_special_tokens"] = merged
+        if verbose:
+            print("  Fixed extra_special_tokens -> additional_special_tokens")
+
+    if rewrite:
+        tc_path.write_text(
+            json.dumps(tc, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+
 def _find_chat_template(search_dirs: list[Path]) -> Path | None:
     for d in search_dirs:
         candidate = d / CHAT_TEMPLATE_FILENAME
@@ -95,6 +124,8 @@ def ensure_gigachat3_tokenizer(
         tokenizer.save_pretrained(str(model_dir))
         if verbose:
             print(f"  Tokenizer saved to {model_dir}")
+
+        _fix_tokenizer_config_json(model_dir, verbose)
 
         config_path = model_dir / "config.json"
         if config_path.exists():

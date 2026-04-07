@@ -23,7 +23,7 @@ services:
       - ./work:/workspace/work
 
       # Pre-downloaded model weights (in /workspace/models so Studio sees it)
-      - /home/pasha/train/ruGPT3XL-8k:/workspace/models/ruGPT3XL-8k:ro
+      - /home/pasha/train/ruGPT3XL-8k:/workspace/models/ruGPT3XL-8k
 
       # Patch unsloth code: mount modified files over installed package
       - ./unsloth/unsloth/models/_utils.py:/opt/conda/lib/python3.11/site-packages/unsloth/models/_utils.py:ro
