@@ -82,10 +82,13 @@ def main():
 
     new_vocab = len(tokenizer)
     old_vocab = model.config.vocab_size
-    if new_vocab != old_vocab:
+    if new_vocab > old_vocab:
         model.resize_token_embeddings(new_vocab)
         if rank == 0:
             print(f"  Resized embeddings: {old_vocab} -> {new_vocab}")
+    elif new_vocab < old_vocab and rank == 0:
+        print(f"  Tokenizer vocab ({new_vocab}) < model vocab ({old_vocab}), "
+              f"keeping model size (extra slots are harmless)")
 
     # ── Step 2: Apply LoRA ──
     if rank == 0:

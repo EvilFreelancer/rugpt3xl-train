@@ -132,7 +132,7 @@ def ensure_gigachat3_tokenizer(
             config = json.loads(config_path.read_text(encoding="utf-8"))
             old_vocab = config.get("vocab_size", 0)
             new_vocab = len(tokenizer)
-            if old_vocab != new_vocab:
+            if new_vocab > old_vocab:
                 config["vocab_size"] = new_vocab
                 config_path.write_text(
                     json.dumps(config, indent=2, ensure_ascii=False) + "\n",
@@ -140,6 +140,9 @@ def ensure_gigachat3_tokenizer(
                 )
                 if verbose:
                     print(f"  config.json: vocab_size {old_vocab} -> {new_vocab}")
+            elif verbose and new_vocab < old_vocab:
+                print(f"  config.json: keeping vocab_size={old_vocab} "
+                      f"(tokenizer has {new_vocab}, model weights have {old_vocab})")
 
     if verbose:
         for tok in GIGACHAT3_SPECIAL_TOKENS:

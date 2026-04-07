@@ -1,3 +1,4 @@
 runs/
+unsloth_compiled_cache/
 *.jsonl
 *.log

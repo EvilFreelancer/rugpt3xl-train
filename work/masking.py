@@ -12,11 +12,8 @@ boilerplate, DEVSYSTEM) is masked with label=-100.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    import torch
-
+import torch
 from transformers import PreTrainedTokenizerBase
 
 
@@ -75,13 +72,17 @@ class AssistantOnlyCollator:
     mlm: bool = False
 
     def __call__(self, features: list[dict]) -> dict:
+        labels_list = []
         for feat in features:
             ids = feat["input_ids"]
             if isinstance(ids, torch.Tensor):
                 ids = ids.tolist()
-            feat["labels"] = build_assistant_mask(
-                ids, self.response_marker_ids, self.message_end_ids,
+            labels_list.append(
+                build_assistant_mask(
+                    ids, self.response_marker_ids, self.message_end_ids,
+                )
             )
+            feat.pop("labels", None)
 
         batch = self.tokenizer.pad(
             features,
@@ -90,8 +91,12 @@ class AssistantOnlyCollator:
             return_tensors="pt",
         )
 
-        if "labels" in batch:
-            batch["labels"][batch["labels"] == self.tokenizer.pad_token_id] = IGNORE_INDEX
+        max_len = batch["input_ids"].shape[1]
+        padded_labels = torch.full((len(labels_list), max_len), IGNORE_INDEX, dtype=torch.long)
+        for i, lab in enumerate(labels_list):
+            length = min(len(lab), max_len)
+            padded_labels[i, :length] = torch.tensor(lab[:length], dtype=torch.long)
+        batch["labels"] = padded_labels
 
         return batch
 
