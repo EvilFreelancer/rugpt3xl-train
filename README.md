@@ -23,22 +23,23 @@ docker exec unsloth python -u /workspace/work/train_rugpt3xl.py
 Studio UI is available at `http://<host>:8000` (default credentials: `unsloth` / `12345678`).
 Jupyter Lab is at `http://<host>:8888`.
 
-### Multi-GPU DDP (recommended, 4x RTX 5060 Ti)
+### Multi-GPU pipeline (device_map="balanced", recommended)
+
+```bash
+docker exec unsloth python -u /workspace/work/train_rugpt3xl_multigpu.py
+```
+
+Splits 24 layers across all GPUs. GBS = 128 (1 batch * 128 gradient accumulation).
+Automatically patches the tokenizer with GigaChat3 special tokens on first run.
+
+### Multi-GPU DDP (4x RTX 5060 Ti)
 
 ```bash
 docker exec unsloth torchrun --nproc_per_node=4 /workspace/work/train_rugpt3xl_ddp.py
 ```
 
 Each GPU trains its own copy of the model on a separate data batch.
-Effective batch size = 4 GPUs * 1 batch * 4 gradient_accumulation = 16.
-
-### Multi-GPU pipeline (device_map="balanced")
-
-```bash
-docker exec unsloth python -u /workspace/work/train_rugpt3xl_multigpu.py
-```
-
-Splits 24 layers across all GPUs. Useful when a model doesn't fit on a single GPU. Slower than DDP because layers are processed sequentially.
+GBS = 128 (4 GPUs * 1 batch * 32 gradient accumulation).
 
 ### Monitor training
 
@@ -131,31 +132,106 @@ Roles are normalized to `system`, `user`, `assistant`, `tool`. All text is trunc
 - Deduplication by first 200 characters of each user message
 - Final shuffle before saving
 
+## Tokenizer patching (GigaChat3 compatibility)
+
+Before training, both scripts automatically patch the `ruGPT3XL-8k` tokenizer to be compatible with vLLM's `gigachat3_tool_parser`. This is handled by `work/tokenizer_setup.py` and is fully idempotent (skips if already done).
+
+### Special tokens added
+
+| Token | ID | Purpose |
+|---|---|---|
+| `<\|role_sep\|>` | 50257 | Separates role name from message content |
+| `<\|message_sep\|>` | 50258 | End-of-message boundary |
+| `<\|function_call\|>` | 50259 | Marks the start of a tool/function call JSON |
+| `<\|file\|>` | 50260 | File content start marker |
+| `<\|/file\|>` | 50261 | File content end marker |
+
+These match the special tokens from [ai-sage/GigaChat3.1-10B-A1.8B](https://huggingface.co/ai-sage/GigaChat3.1-10B-A1.8B). The original `ruGPT3XL-8k` checkpoint has `vocab_size=50264` in its weights, so tokens 50257-50261 fit into already-allocated embedding slots without requiring a resize.
+
+### Chat template
+
+The chat template (`work/chat_template_gigachat3.jinja`) is adapted from GigaChat3. It renders conversations using a multi-role format with tool-calling support:
+
+```
+<s>role_name<|role_sep|>
+content<|message_sep|>
+
+```
+
+Key features:
+- Renders tool schemas as TypeScript type definitions (matching GigaChat3 conventions)
+- Includes a DEVSYSTEM block with role descriptions and behavioral instructions
+- Supports `<think>` blocks for chain-of-thought reasoning
+- Compatible with vLLM's `gigachat3_tool_parser` for inference-time tool parsing
+
+The patching process:
+1. `ensure_gigachat3_tokenizer(model_dir)` is called at the very start of training
+2. Checks if all 5 special tokens already resolve to valid IDs (not `<unk>`)
+3. Checks if the chat template contains `<|role_sep|>`
+4. If anything is missing, adds tokens and/or applies the template, then saves in-place
+5. Fixes the `extra_special_tokens` vs `additional_special_tokens` format issue across transformers versions
+
+### Embedding handling
+
+Since the new token IDs (50257-50261) fall within the existing weight matrix (50264 rows), no `resize_token_embeddings` is needed. The training scripts only resize UP, never down. To ensure the new token embeddings are properly learned, `modules_to_save=["embed_tokens", "lm_head"]` is passed to LoRA so these layers are trained in full precision alongside the adapters.
+
+## Loss masking (assistant-only training)
+
+Training loss is computed only on assistant response tokens. Everything else (system prompts, user messages, template boilerplate, DEVSYSTEM instructions) is masked with `label=-100`.
+
+This is implemented in `work/masking.py` via `AssistantOnlyCollator`:
+
+1. For each sample, the collator searches for the token sequence `assistant<|role_sep|>\n` (response start marker)
+2. Tokens between this marker and the next `<|message_sep|>` are labeled with their actual IDs
+3. All other tokens get `label=-100` (ignored by CrossEntropyLoss)
+4. Works correctly for multi-turn conversations with multiple assistant responses
+
+Samples that contain no assistant responses are filtered out before training to avoid NaN loss.
+
+Typical masking ratio is ~75% masked / ~25% trained (varies by sample).
+
 ## Training configuration
 
-### DDP (4x GPU, recommended)
+### Multi-GPU pipeline (device_map="balanced")
 
-Launched via `work/train_rugpt3xl_ddp.py` with `torchrun --nproc_per_node=4`.
+Launched via `work/train_rugpt3xl_multigpu.py`. Splits 24 model layers across all GPUs.
 
 | Parameter | Value |
 |---|---|
-| Model | `/workspace/models/ruGPT3XL-8k` (local mount) |
+| Model | `ruGPT3XL-8k` (1.3B params, local mount) |
 | Method | QLoRA (4-bit NF4) |
-| `trust_remote_code` | `true` |
 | `max_seq_length` | 8192 |
-| LoRA rank / alpha | 16 / 16 |
+| LoRA rank / alpha | 64 / 128 |
 | Target modules | `q_proj`, `k_proj`, `v_proj`, `o_proj`, `up_proj`, `down_proj` |
+| `modules_to_save` | `embed_tokens`, `lm_head` |
+| Trainable params | ~262M / 1.09B (24%) |
 | Epochs | 3 |
 | Per-device batch size | 1 |
-| Gradient accumulation | 4 (effective batch = 4 * 1 * 4 = 16) |
-| Learning rate | 2e-4, cosine schedule |
-| Warmup | 100 steps |
+| Gradient accumulation | 128 (GBS = 128) |
+| Learning rate | 5e-5, cosine schedule |
+| Warmup | 10% of total steps |
+| Weight decay | 0.01 |
+| Max grad norm | 1.0 |
 | Optimizer | `adamw_8bit` |
+| Precision | bf16 |
 | Gradient checkpointing | `use_reentrant=False` |
-| Eval every | 100 steps |
-| Save every | 500 steps |
-| TensorBoard | enabled (`/workspace/work/runs/rugpt3xl-8k-ddp/logs`) |
-| Peak GPU memory | ~15.8GB / 16GB per GPU |
+| Eval strategy | every 100 steps + on start |
+| Eval subset | 500 random samples (from 7k) |
+| Save strategy | every 100 steps, keep best 5 |
+| Best model metric | `eval_loss` (lower is better) |
+| Early stopping | patience = 5 evals |
+| Loss masking | assistant-only via `AssistantOnlyCollator` |
+| TensorBoard | `/workspace/work/runs/rugpt3xl-8k-multigpu/logs` |
+
+### DDP (4x GPU)
+
+Launched via `work/train_rugpt3xl_ddp.py` with `torchrun --nproc_per_node=4`. Each GPU trains its own copy.
+
+| Parameter | Value |
+|---|---|
+| Per-device batch size | 1 |
+| Gradient accumulation | 32 (GBS = 4 * 1 * 32 = 128) |
+| All other params | Same as pipeline mode above |
 
 ### Single GPU (via Studio API)
 
@@ -166,30 +242,35 @@ Launched via `work/train_rugpt3xl.py` which calls the Unsloth Studio REST API.
 | `max_seq_length` | 4096 |
 | Batch size | 2 |
 | Gradient accumulation | 8 (effective batch = 16) |
-| Other parameters | Same as DDP |
+| LoRA rank / alpha | 16 / 16 (original, not updated) |
 
 ## Project structure
 
 ```
-docker-compose.yaml              - Container setup, GPU, volumes
+docker-compose.yaml                - Container setup, GPU, volumes
 work/
-  prepare_dataset.py             - Build 150k training JSONL
-  prepare_eval_dataset.py        - Build ~7k eval JSONL
-  train_rugpt3xl.py              - Launch training via Studio API (single GPU)
-  train_rugpt3xl_ddp.py          - DDP training on 4 GPUs via torchrun
-  train_rugpt3xl_multigpu.py     - Pipeline-parallel training via device_map
-  measure_memory.py              - GPU memory profiling script
-  test_single_gpu_optimized.py   - Attention optimization test
+  train_rugpt3xl_multigpu.py       - Pipeline-parallel training (device_map="balanced")
+  train_rugpt3xl_ddp.py            - DDP training on 4 GPUs via torchrun
+  train_rugpt3xl.py                - Training via Studio API (single GPU)
+  masking.py                       - AssistantOnlyCollator + masking logic
+  tokenizer_setup.py               - Idempotent GigaChat3 tokenizer patching
+  patch_tokenizer.py               - Manual tokenizer patching CLI wrapper
+  chat_template_gigachat3.jinja    - GigaChat3-adapted Jinja chat template
+  prepare_dataset.py               - Build 150k training JSONL
+  prepare_eval_dataset.py          - Build ~7k eval JSONL
+  plot_training_log.py             - Parse training logs and plot metrics
+  measure_memory.py                - GPU memory profiling script
+  test_single_gpu_optimized.py     - Attention optimization test
 unsloth/
-  unsloth/models/_utils.py       - Patch: graceful skip for custom model types in compile loop
+  unsloth/models/_utils.py         - Patch: graceful skip for custom model types
   studio/backend/
     assets/configs/model_defaults/other/
       evilfreelancer_ruGPT3XL-8k.yaml  - Model defaults for Studio
     utils/models/
-      model_config.py            - MODEL_NAME_MAPPING with ruGPT3XL-8k entries
+      model_config.py              - MODEL_NAME_MAPPING with ruGPT3XL-8k entries
 unsloth_data/
-  studio/                        - Persisted Studio state (auth DB, runs, cache)
-  huggingface/                   - HF model/dataset cache
+  studio/                          - Persisted Studio state (auth DB, runs, cache)
+  huggingface/                     - HF model/dataset cache
 ```
 
 ## Unsloth patches
