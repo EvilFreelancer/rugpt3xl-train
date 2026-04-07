@@ -8,6 +8,7 @@ services:
       - "8888:8888"
       - "8000:8000"
       - "2222:22"
+      - "6006:6006"
 
     environment:
       JUPYTER_PASSWORD: "change-me"

@@ -1,4 +1,5 @@
 runs/
 unsloth_compiled_cache/
+fsdp_worker_logs/
 *.jsonl
 *.log
