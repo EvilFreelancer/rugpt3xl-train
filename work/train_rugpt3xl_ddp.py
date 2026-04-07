@@ -89,11 +89,11 @@ def main():
 
     # ── Step 2: Apply LoRA ──
     if rank == 0:
-        print("[2/5] Applying LoRA (r=16) ...")
+        print("[2/5] Applying LoRA (r=64, alpha=128) ...")
     model = FastLanguageModel.get_peft_model(
         model,
-        r=16,
-        lora_alpha=16,
+        r=64,
+        lora_alpha=128,
         lora_dropout=0.0,
         target_modules=[
             "q_proj", "k_proj", "v_proj", "o_proj",
@@ -144,12 +144,29 @@ def main():
     if rank == 0:
         print(f"  Train: {len(train_ds)}, Eval: {len(eval_ds)} (subsampled)")
 
+    # ── Step 3b: Verify masking on a sample ──
+    from masking import (
+        AssistantOnlyCollator, get_marker_ids, print_masking_diagnostic,
+    )
+    resp_ids, end_ids = get_marker_ids(tokenizer)
+    if rank == 0:
+        print(f"\n  Response marker IDs: {resp_ids}")
+        print(f"  Message end IDs:     {end_ids}")
+        print_masking_diagnostic(tokenizer, train_ds[0]["text"], resp_ids, end_ids)
+
     # ── Step 4: Configure trainer ──
     if rank == 0:
-        print("[4/5] Configuring SFTTrainer ...")
+        print("\n[4/5] Configuring SFTTrainer ...")
     from trl import SFTTrainer, SFTConfig
     from unsloth import is_bfloat16_supported
     from transformers import EarlyStoppingCallback
+
+    collator = AssistantOnlyCollator(
+        tokenizer=tokenizer,
+        response_marker_ids=resp_ids,
+        message_end_ids=end_ids,
+        max_seq_length=MAX_SEQ_LENGTH,
+    )
 
     # GBS = world_size * per_device_train_batch_size * gradient_accumulation_steps
     # GBS = 4 * 1 * 32 = 128
@@ -201,6 +218,7 @@ def main():
         tokenizer=tokenizer,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
+        data_collator=collator,
         args=sft_config,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
     )
