@@ -187,14 +187,14 @@ def main():
         max_seq_length=MAX_SEQ_LENGTH,
     )
 
-    # GBS = per_device_train_batch_size * gradient_accumulation_steps = 2 * 64 = 128
+    # GBS = per_device_train_batch_size * gradient_accumulation_steps = 1 * 128 = 128
     sft_config = SFTConfig(
         output_dir=OUTPUT_DIR,
         max_seq_length=MAX_SEQ_LENGTH,
 
-        per_device_train_batch_size=2,
+        per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
-        gradient_accumulation_steps=64,
+        gradient_accumulation_steps=128,
 
         num_train_epochs=3,
         learning_rate=5e-5,

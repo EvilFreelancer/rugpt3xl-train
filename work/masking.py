@@ -70,8 +70,10 @@ class AssistantOnlyCollator:
     message_end_ids: list[int] = field(default_factory=list)
     max_seq_length: int | None = None
     mlm: bool = False
+    _call_count: int = field(default=0, repr=False, init=False)
 
     def __call__(self, features: list[dict]) -> dict:
+        self._call_count += 1
         labels_list = []
         for feat in features:
             ids = feat["input_ids"]
@@ -83,6 +85,22 @@ class AssistantOnlyCollator:
                 )
             )
             feat.pop("labels", None)
+
+        if self._call_count <= 3:
+            for i, (lab, feat) in enumerate(zip(labels_list, features)):
+                ids = feat["input_ids"]
+                if isinstance(ids, torch.Tensor):
+                    ids = ids.tolist()
+                trained = sum(1 for x in lab if x != IGNORE_INDEX)
+                print(f"  [Collator batch#{self._call_count} sample#{i}] "
+                      f"len={len(ids)}, trained={trained}/{len(lab)}, "
+                      f"first_10_ids={ids[:10]}")
+                if trained == 0:
+                    resp_pos = _find_subsequence(ids, self.response_marker_ids)
+                    end_pos = _find_subsequence(ids, self.message_end_ids)
+                    print(f"    WARNING: 0 trained tokens! "
+                          f"resp_marker_positions={resp_pos}, "
+                          f"end_marker_positions={end_pos}")
 
         batch = self.tokenizer.pad(
             features,
