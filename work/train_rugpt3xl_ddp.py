@@ -14,13 +14,17 @@ Monitor:
 """
 
 import os
+import sys
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_OFFLINE"] = "1"
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 import torch
 
+MODEL_DIR = "/workspace/models/ruGPT3XL-8k"
 MAX_SEQ_LENGTH = 8192
 OUTPUT_DIR = "/workspace/work/runs/rugpt3xl-8k-ddp"
 
@@ -55,18 +59,33 @@ def main():
         print(f"PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}")
         print()
 
+    # ── Step 0: Ensure tokenizer has GigaChat3 tokens (rank 0 only) ──
+    if rank == 0:
+        print("[0/5] Checking tokenizer ...")
+        from tokenizer_setup import ensure_gigachat3_tokenizer
+        ensure_gigachat3_tokenizer(MODEL_DIR)
+    if world_size > 1:
+        torch.distributed.barrier()
+
     # ── Step 1: Load model ──
     if rank == 0:
-        print("[1/5] Loading model ...")
+        print("\n[1/5] Loading model ...")
     from unsloth import FastLanguageModel
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name="/workspace/models/ruGPT3XL-8k",
+        model_name=MODEL_DIR,
         max_seq_length=MAX_SEQ_LENGTH,
         load_in_4bit=True,
         dtype=None,
         trust_remote_code=True,
     )
+
+    new_vocab = len(tokenizer)
+    old_vocab = model.config.vocab_size
+    if new_vocab != old_vocab:
+        model.resize_token_embeddings(new_vocab)
+        if rank == 0:
+            print(f"  Resized embeddings: {old_vocab} -> {new_vocab}")
 
     # ── Step 2: Apply LoRA ──
     if rank == 0:
@@ -80,6 +99,7 @@ def main():
             "q_proj", "k_proj", "v_proj", "o_proj",
             "up_proj", "down_proj",
         ],
+        modules_to_save=["embed_tokens", "lm_head"],
     )
     if rank == 0:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -117,29 +137,36 @@ def main():
     train_ds = train_ds.filter(lambda x: bool(x["text"]))
     eval_ds = eval_ds.filter(lambda x: bool(x["text"]))
 
+    EVAL_SUBSET_SIZE = 500
+    if len(eval_ds) > EVAL_SUBSET_SIZE:
+        eval_ds = eval_ds.shuffle(seed=42).select(range(EVAL_SUBSET_SIZE))
+
     if rank == 0:
-        print(f"  Train: {len(train_ds)}, Eval: {len(eval_ds)}")
+        print(f"  Train: {len(train_ds)}, Eval: {len(eval_ds)} (subsampled)")
 
     # ── Step 4: Configure trainer ──
     if rank == 0:
         print("[4/5] Configuring SFTTrainer ...")
     from trl import SFTTrainer, SFTConfig
     from unsloth import is_bfloat16_supported
+    from transformers import EarlyStoppingCallback
 
-    # With 4 GPUs DDP: effective_batch = 4 * 1 * 4 = 16 (same as single GPU with accum=16)
+    # GBS = world_size * per_device_train_batch_size * gradient_accumulation_steps
+    # GBS = 4 * 1 * 32 = 128
     sft_config = SFTConfig(
         output_dir=OUTPUT_DIR,
         max_seq_length=MAX_SEQ_LENGTH,
 
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=32,
 
         num_train_epochs=3,
-        learning_rate=2e-4,
+        learning_rate=5e-5,
         lr_scheduler_type="cosine",
-        warmup_steps=100,
-        weight_decay=0.001,
+        warmup_ratio=0.1,
+        weight_decay=0.01,
+        max_grad_norm=1.0,
         optim="adamw_8bit",
 
         fp16=not is_bfloat16_supported(),
@@ -149,9 +176,13 @@ def main():
         gradient_checkpointing_kwargs={"use_reentrant": False},
 
         eval_strategy="steps",
-        eval_steps=500,
-        save_steps=500,
-        save_total_limit=3,
+        eval_steps=100,
+        eval_on_start=True,
+        save_steps=100,
+        save_total_limit=5,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
 
         logging_steps=10,
         logging_dir=f"{OUTPUT_DIR}/logs",
@@ -171,6 +202,7 @@ def main():
         train_dataset=train_ds,
         eval_dataset=eval_ds,
         args=sft_config,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
     )
 
     if rank == 0:
