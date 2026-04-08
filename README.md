@@ -63,6 +63,12 @@ docker exec unsloth tensorboard --logdir /workspace/work/runs --bind_all
 
 TensorBoard will be at `http://<host>:6006`.
 
+The FSDP script (`train_rugpt3xl_fsdp.py`) writes events under `runs/rugpt3xl-8k-fsdp/logs` and prints the same step metrics to stdout on rank 0 via `ConsoleLogCallback` (with flush so pipes and `tee` work). Use both TensorBoard and a log file, for example:
+
+```bash
+docker exec unsloth bash -c 'torchrun --nproc_per_node=4 /workspace/work/train_rugpt3xl_fsdp.py 2>&1 | tee /workspace/work/training_fsdp.log'
+```
+
 ## Memory-efficient attention
 
 The model code (`modeling_rugpt3xl.py`) has built-in memory-efficient attention

@@ -20,18 +20,24 @@ Usage (inside container):
 
 Monitor:
     tensorboard --logdir /workspace/work/runs/rugpt3xl-8k-fsdp/logs
+    Training metrics are written to TensorBoard (logging_dir) and printed on rank 0
+    (ConsoleLogCallback with flush for pipe/tee).
 """
 
+import glob
 import os
 import sys
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "1"
+os.environ["NCCL_TIMEOUT"] = "1800"  # 30 min for slow checkpoint operations
+os.environ["FSDP_STATE_DICT_TYPE"] = "SHARDED_STATE_DICT"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
+from transformers import TrainerCallback
 
 MODEL_DIR = "/workspace/models/ruGPT3XL-8k"
 MAX_SEQ_LENGTH = 8192
@@ -44,6 +50,30 @@ NUM_EPOCHS = 3
 GBS = 128
 PER_DEVICE_BATCH = 1
 EVAL_SUBSET_SIZE = 500
+
+
+class ConsoleLogCallback(TrainerCallback):
+    """Print the same metrics as TensorBoard to stdout on rank 0 (flush for tee/pipes)."""
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero or logs is None:
+            return
+        out = dict(logs)
+        out.pop("total_flos", None)
+        print(out, flush=True)
+
+
+def get_valid_checkpoints(output_dir: str) -> list[str]:
+    """
+    Ignore partially written FSDP checkpoints.
+    A usable trainer checkpoint must contain trainer_state.json.
+    """
+    candidates = sorted(glob.glob(f"{output_dir}/checkpoint-*"))
+    valid = []
+    for ckpt in candidates:
+        if os.path.exists(os.path.join(ckpt, "trainer_state.json")):
+            valid.append(ckpt)
+    return valid
 
 
 def format_conversations(examples, tokenizer):
@@ -237,6 +267,7 @@ def main():
         "sync_module_states": True,
         "cpu_ram_efficient_loading": True,
         "activation_checkpointing": True,
+        "state_dict_type": "SHARDED_STATE_DICT",
     }
 
     sft_config = SFTConfig(
@@ -262,19 +293,21 @@ def main():
         fsdp_config=fsdp_config,
 
         eval_strategy="steps",
-        eval_steps=100,
+        eval_steps=50,
         eval_on_start=True,
-        save_steps=100,
+        save_steps=50,
         save_total_limit=5,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
 
         logging_steps=1,
+        logging_first_step=True,
         logging_dir=f"{OUTPUT_DIR}/logs",
 
         seed=42,
-        report_to="tensorboard",
+        report_to=["tensorboard"],
+        disable_tqdm=False,
 
         dataset_text_field="text",
         packing=False,
@@ -291,17 +324,24 @@ def main():
         eval_dataset=eval_ds,
         data_collator=collator,
         args=sft_config,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+        callbacks=[
+            EarlyStoppingCallback(early_stopping_patience=5),
+            ConsoleLogCallback(),
+        ],
     )
 
     if is_main:
         print("  Trainer ready!")
 
-    # ── Step 6: Train ──
+    # ── Step 6: Train (auto-resume from latest checkpoint if available) ──
+    ckpts = get_valid_checkpoints(OUTPUT_DIR)
+    resume_from = ckpts[-1] if ckpts else None
     if is_main:
-        print("\n[6/6] Starting training ...")
+        print(f"\n[6/6] Starting training ...")
+        if resume_from:
+            print(f"  Resuming from {resume_from}")
         print("=" * 70)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=resume_from)
 
     if is_main:
         save_path = f"{OUTPUT_DIR}/final_lora"
