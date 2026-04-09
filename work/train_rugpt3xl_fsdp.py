@@ -37,7 +37,34 @@ os.environ["FSDP_STATE_DICT_TYPE"] = "SHARDED_STATE_DICT"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
+import torch.nn.functional as F
 from transformers import TrainerCallback
+
+
+def assistant_only_loss(outputs, labels, num_items_in_batch=None):
+    """
+    Custom loss function for assistant-only training.
+    Computes cross-entropy loss only on non-masked tokens (labels != -100).
+    This ensures train and eval losses are computed consistently.
+    """
+    logits = outputs.logits
+    # Shift for causal LM (predict next token)
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    # Flatten
+    shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    shift_labels = shift_labels.view(-1)
+
+    # Compute mean loss on non-masked tokens only
+    loss = F.cross_entropy(
+        shift_logits,
+        shift_labels,
+        ignore_index=-100,
+        reduction="mean",
+    )
+
+    return loss
 
 MODEL_DIR = "/workspace/models/ruGPT3XL-8k"
 MAX_SEQ_LENGTH = 8192
@@ -61,6 +88,30 @@ class ConsoleLogCallback(TrainerCallback):
         out = dict(logs)
         out.pop("total_flos", None)
         print(out, flush=True)
+
+
+class SaveAdapterCallback(TrainerCallback):
+    """Save LoRA adapter separately from FSDP checkpoint (only rank 0)."""
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return control
+
+        adapter_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}", "adapter_model")
+        os.makedirs(adapter_dir, exist_ok=True)
+
+        # Get model from kwargs (SFTTrainer passes it)
+        model = kwargs.get("model")
+        if model is None:
+            return control
+
+        # Save only LoRA adapter, not full FSDP model
+        if hasattr(model, "save_pretrained"):
+            model.save_pretrained(adapter_dir, save_embedding_layers=False)
+        elif hasattr(model, "module") and hasattr(model.module, "save_pretrained"):
+            model.module.save_pretrained(adapter_dir, save_embedding_layers=False)
+
+        return control
 
 
 def get_valid_checkpoints(output_dir: str) -> list[str]:
@@ -324,9 +375,11 @@ def main():
         eval_dataset=eval_ds,
         data_collator=collator,
         args=sft_config,
+        compute_loss_func=assistant_only_loss,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=5),
             ConsoleLogCallback(),
+            SaveAdapterCallback(),
         ],
     )
 

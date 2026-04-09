@@ -206,6 +206,28 @@ This is implemented in `work/masking.py` via `AssistantOnlyCollator`:
 3. All other tokens get `label=-100` (ignored by CrossEntropyLoss)
 4. Works correctly for multi-turn conversations with multiple assistant responses
 
+### Why `compute_loss_func` is required
+
+By default, `SFTTrainer` relies on the model's internal loss computation when `labels` are not explicitly used. However, the model computes loss over **all** tokens in `input_ids`, ignoring our carefully constructed `labels` mask. This causes a train/eval loss mismatch:
+- Train loss: computed via collator's `labels` (assistant-only)
+- Eval loss: computed by model on all tokens (incorrect, higher values)
+
+To fix this, we pass a custom `compute_loss_func` to `SFTTrainer`:
+
+```python
+def assistant_only_loss(outputs, labels, num_items_in_batch=None):
+    logits = outputs.logits[..., :-1, :].contiguous()
+    labels = labels[..., 1:].contiguous()
+    return F.cross_entropy(
+        logits.view(-1, logits.size(-1)),
+        labels.view(-1),
+        ignore_index=-100,
+        reduction="mean"
+    )
+```
+
+This ensures both train and eval losses are computed consistently on assistant tokens only.
+
 Samples that contain no assistant responses are filtered out before training to avoid NaN loss.
 
 Typical masking ratio is ~75% masked / ~25% trained (varies by sample).
