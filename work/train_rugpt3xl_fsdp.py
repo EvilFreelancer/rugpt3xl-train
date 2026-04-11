@@ -31,8 +31,17 @@ import sys
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["FSDP_CPU_RAM_EFFICIENT_LOADING"] = "1"
-os.environ["NCCL_TIMEOUT"] = "1800"  # 30 min for slow checkpoint operations
+os.environ["NCCL_TIMEOUT"] = "3600"  # 60 min for slow checkpoint operations
 os.environ["FSDP_STATE_DICT_TYPE"] = "SHARDED_STATE_DICT"
+os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"  # More reliable but slower NCCL
+# Note: TORCH_DISTRIBUTED_DEBUG disabled to reduce log spam from FSDP
+
+# Suppress verbose FSDP warnings
+import warnings
+warnings.filterwarnings("ignore", message=".*FSDP firing post-backward hooks.*")
+warnings.filterwarnings("ignore", message=".*FSDP.state_dict_type.*")
+warnings.filterwarnings("ignore", message=".*ShardedTensor.*")
+warnings.filterwarnings("ignore", message=".*Please use DTensor.*")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -91,25 +100,50 @@ class ConsoleLogCallback(TrainerCallback):
 
 
 class SaveAdapterCallback(TrainerCallback):
-    """Save LoRA adapter separately from FSDP checkpoint (only rank 0)."""
+    """Save LoRA adapter after evaluation using external script."""
 
-    def on_save(self, args, state, control, **kwargs):
+    def __init__(self):
+        self.last_extracted_step = 0
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        """Extract LoRA adapter after evaluation on rank 0."""
         if not state.is_world_process_zero:
             return control
 
-        adapter_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}", "adapter_model")
-        os.makedirs(adapter_dir, exist_ok=True)
+        # Only extract every 50 steps (after eval)
+        if state.global_step - self.last_extracted_step < 50:
+            return control
+        self.last_extracted_step = state.global_step
 
-        # Get model from kwargs (SFTTrainer passes it)
-        model = kwargs.get("model")
-        if model is None:
+        # Run extraction script in background (non-blocking)
+        import subprocess
+        checkpoint_path = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        adapter_path = os.path.join(checkpoint_path, "adapter_model")
+
+        # Check if adapter already exists
+        adapter_file = os.path.join(adapter_path, "adapter_model.safetensors")
+        if os.path.exists(adapter_file):
+            print(f"[SaveAdapterCallback] Adapter already exists at step {state.global_step}, skipping")
             return control
 
-        # Save only LoRA adapter, not full FSDP model
-        if hasattr(model, "save_pretrained"):
-            model.save_pretrained(adapter_dir, save_embedding_layers=False)
-        elif hasattr(model, "module") and hasattr(model.module, "save_pretrained"):
-            model.module.save_pretrained(adapter_dir, save_embedding_layers=False)
+        # Build and run extraction script
+        extract_script = os.path.join(os.path.dirname(__file__), "extract_lora_from_checkpoint.py")
+        if os.path.exists(extract_script):
+            cmd = [
+                "python", extract_script,
+                checkpoint_path,
+                adapter_path,
+                ">/dev/null", "2>&1", "&"
+            ]
+            print(f"[SaveAdapterCallback] Starting LoRA extraction for step {state.global_step}", flush=True)
+            subprocess.Popen(
+                " ".join(cmd),
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        else:
+            print(f"[SaveAdapterCallback] Warning: extract_lora_from_checkpoint.py not found", flush=True)
 
         return control
 
@@ -347,7 +381,7 @@ def main():
         eval_steps=50,
         eval_on_start=True,
         save_steps=50,
-        save_total_limit=5,
+        save_total_limit=3,
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
@@ -379,7 +413,7 @@ def main():
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=5),
             ConsoleLogCallback(),
-            SaveAdapterCallback(),
+            SaveAdapterCallback(),  # Extracts LoRA after eval
         ],
     )
 
@@ -396,11 +430,30 @@ def main():
         print("=" * 70)
     trainer.train(resume_from_checkpoint=resume_from)
 
+    # Final save - all ranks must participate for FSDP
+    save_path = f"{OUTPUT_DIR}/final_lora"
+
+    # Unwrap FSDP and save only LoRA adapter on rank 0
+    if world_size > 1:
+        torch.distributed.barrier()
+
     if is_main:
-        save_path = f"{OUTPUT_DIR}/final_lora"
-        trainer.save_model(save_path)
-        tokenizer.save_pretrained(save_path)
-        print(f"\nLoRA adapter saved to: {save_path}")
+        from peft import PeftModel
+
+        # Get unwrapped model
+        unwrapped_model = trainer.model
+        while hasattr(unwrapped_model, "module"):
+            unwrapped_model = unwrapped_model.module
+
+        if isinstance(unwrapped_model, PeftModel):
+            unwrapped_model.save_pretrained(save_path, safe_serialization=True)
+            tokenizer.save_pretrained(save_path)
+            print(f"\nLoRA adapter saved to: {save_path}")
+        else:
+            # Fallback to trainer's save
+            trainer.save_model(save_path)
+            tokenizer.save_pretrained(save_path)
+            print(f"\nModel saved to: {save_path}")
 
 
 if __name__ == "__main__":
